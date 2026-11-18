@@ -106,6 +106,19 @@ async function awaitFinished(): Promise<void> {
 /** Bind the forge, announce it, then wait for the env: the whole life of the process. */
 async function run(): Promise<void> {
   const server = createApp();
+  // Keep one idle keep-alive socket alive across the gaps between the
+  // suite's workloads (the read workload reuses a single connection for
+  // 2,000 requests; the 5 s default would close it between phases and
+  // force a reconnect). A malformed request ends its socket with a 400
+  // instead of taking the server down with it.
+  server.keepAliveTimeout = 30_000;
+  server.on('clientError', (_err, socket) => {
+    try {
+      socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+    } catch {
+      socket.destroy();
+    }
+  });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, () => resolve());
@@ -115,6 +128,18 @@ async function run(): Promise<void> {
     throw new Error('the server did not bind an ephemeral TCP port');
   }
   process.stdout.write(`[entry] listening on port ${bound.port}\n`);
+
+  // The trial ends with SIGTERM: close the server and exit 0 instead of
+  // dying on the signal (a 143 exit reads as a crash to the harness).
+  // server.close() waits for open connections, so a 5 s fallback forces
+  // the exit if a keep-alive socket holds it open.
+  let stopping = false;
+  process.once('SIGTERM', () => {
+    if (stopping) return;
+    stopping = true;
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5_000).unref();
+  });
 
   await announcePort(bound.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');

@@ -244,9 +244,99 @@ export function getPathEntry(
 // ---------------------------------------------------------------------------------------------
 
 function commitParents(repo: RepoRecord, sha: string): string[] | null {
+  const meta = commitMeta(repo, sha);
+  return meta === null ? null : meta.parents;
+}
+
+/** Parsed commit header (tree + parents), cached per repo: the push path
+ * walks ancestry on every update, and re-parsing the same commit buffers
+ * each time made it quadratic in history length. */
+const commitMetaCache = new WeakMap<RepoRecord, Map<string, { tree: string; parents: string[] }>>();
+
+function commitMeta(repo: RepoRecord, sha: string): { tree: string; parents: string[] } | null {
+  let perRepo = commitMetaCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, { tree: string; parents: string[] }>();
+    commitMetaCache.set(repo, perRepo);
+  }
+  const cached = perRepo.get(sha);
+  if (cached !== undefined) return cached;
   const obj = getObject(repo, sha);
   if (!obj || obj.type !== 'commit') return null;
-  return parseCommit(obj.data).parents;
+  const parsed = parseCommit(obj.data);
+  const meta = { tree: parsed.tree, parents: parsed.parents };
+  perRepo.set(sha, meta);
+  return meta;
+}
+
+/**
+ * Commits known reachable from a ref, per repo. Objects are never removed
+ * from a repo, and a commit only enters this set once its ancestry has been
+ * verified present (receive-pack) or built complete (REST), so stopping a
+ * completeness walk here is sound: everything below it is already in the
+ * repo. A missing entry just means the walk goes further, never a wrong
+ * answer, so REST paths that forget to note a ref stay correct (only
+ * slower).
+ */
+const reachableCache = new WeakMap<RepoRecord, Set<string>>();
+
+function reachableSet(repo: RepoRecord): Set<string> {
+  let set = reachableCache.get(repo);
+  if (set === undefined) {
+    set = new Set<string>();
+    reachableCache.set(repo, set);
+  }
+  return set;
+}
+
+/** Record that `oid` (and its ancestors, up to already-known ones) is reachable from a ref. */
+export function noteReachable(repo: RepoRecord, oid: string): void {
+  const set = reachableSet(repo);
+  const stack: string[] = [oid];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (set.has(cur)) continue;
+    const obj = getObject(repo, cur);
+    if (!obj) continue;
+    if (obj.type === 'commit') {
+      set.add(cur);
+      const parents = commitParents(repo, cur);
+      if (parents === null) continue;
+      for (const parent of parents) stack.push(parent);
+    } else if (obj.type === 'tag') {
+      stack.push(peelTag(repo, cur));
+    }
+  }
+}
+
+/**
+ * Is every commit reachable from `oid` present in the repo (tags peeled)?
+ * Same acceptance as collectReachable(..., allowMissing=false) for the push
+ * path — a missing commit rejects — but it walks cached parent lists and
+ * stops at commits already known reachable, instead of re-parsing every
+ * commit and tree on each push, so a push stays O(new history) instead of
+ * O(whole history). Trees are not re-checked: the original walk tolerated
+ * a missing tree object too.
+ */
+function isComplete(repo: RepoRecord, oid: string): boolean {
+  const known = reachableSet(repo);
+  const seen = new Set<string>();
+  const stack: string[] = [oid];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (seen.has(cur) || known.has(cur)) continue;
+    seen.add(cur);
+    const obj = getObject(repo, cur);
+    if (!obj) return false;
+    if (obj.type === 'commit') {
+      const parents = commitParents(repo, cur);
+      if (parents === null) return false;
+      for (const parent of parents) stack.push(parent);
+    } else if (obj.type === 'tag') {
+      stack.push(peelTag(repo, cur));
+    }
+  }
+  return true;
 }
 
 export function findMergeBase(repo: RepoRecord, a: string, b: string): string | undefined {
@@ -1029,6 +1119,9 @@ function parseFetchArgs(lines: string[]): FetchArgs {
 }
 
 function handleFetchV2(repo: RepoRecord, args: FetchArgs): Buffer {
+  const cacheKey = fetchCacheKey(2, args);
+  const cached = fetchCacheGet(repo, cacheKey);
+  if (cached !== undefined) return cached;
   const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
   const pack = buildPack(repo, plan.send);
   const parts: Buffer[] = [];
@@ -1043,17 +1136,53 @@ function handleFetchV2(repo: RepoRecord, args: FetchArgs): Buffer {
   }
   parts.push(pktLine('packfile\n'));
   parts.push(sidebandPack(pack));
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  if (args.wants.every((want) => getObject(repo, want) !== undefined)) fetchCacheSet(repo, cacheKey, out);
+  return out;
 }
 
 function handleFetchV0(repo: RepoRecord, args: FetchArgs): Buffer {
+  const cacheKey = fetchCacheKey(0, args);
+  const cached = fetchCacheGet(repo, cacheKey);
+  if (cached !== undefined) return cached;
   const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
   const pack = buildPack(repo, plan.send);
   const parts: Buffer[] = [pktLine('NAK\n')];
   for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
   parts.push(sidebandPack(pack));
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  if (args.wants.every((want) => getObject(repo, want) !== undefined)) fetchCacheSet(repo, cacheKey, out);
+  return out;
+}
+
+/**
+ * Fetch-response cache, per repo. A fetch's bytes are fully determined by
+ * (protocol version, wants, haves, shallow boundaries, depth) plus objects
+ * that never change content, so a cached response stays correct without
+ * invalidation — with one guard: a fetch is only cached when every want
+ * was present, so a fetch that answered "missing object" (empty pack) can
+ * never shadow the object arriving later. Bounded; clears when full.
+ */
+const fetchResponseCache = new WeakMap<RepoRecord, Map<string, Buffer>>();
+const FETCH_CACHE_MAX = 128;
+
+function fetchCacheKey(version: 0 | 2, args: FetchArgs): string {
+  return `${version}|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth ?? ''}`;
+}
+
+function fetchCacheGet(repo: RepoRecord, key: string): Buffer | undefined {
+  return fetchResponseCache.get(repo)?.get(key);
+}
+
+function fetchCacheSet(repo: RepoRecord, key: string, value: Buffer): void {
+  let perRepo = fetchResponseCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, Buffer>();
+    fetchResponseCache.set(repo, perRepo);
+  }
+  if (perRepo.size >= FETCH_CACHE_MAX) perRepo.clear();
+  perRepo.set(key, value);
 }
 
 async function handleUploadPack(
@@ -1224,13 +1353,12 @@ async function handleReceivePack(
         results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
         continue;
       }
-      try {
-        collectReachable(repo, [command.newOid], false);
-      } catch {
+      if (!isComplete(repo, command.newOid)) {
         results.push({ ref: command.ref, ok: false, reason: 'missing object' });
         continue;
       }
       repo.refs.set(command.ref, command.newOid);
+      noteReachable(repo, command.newOid);
       results.push({ ref: command.ref, ok: true, reason: '' });
       continue;
     }
@@ -1242,18 +1370,14 @@ async function handleReceivePack(
     } else if (command.newOid === current) {
       results.push({ ref: command.ref, ok: true, reason: '' });
     } else {
-      let complete = true;
-      try {
-        collectReachable(repo, [command.newOid], false);
-      } catch {
-        complete = false;
-      }
+      let complete = isComplete(repo, command.newOid);
       if (!complete) {
         results.push({ ref: command.ref, ok: false, reason: 'missing object' });
       } else if (command.ref.startsWith('refs/heads/') && !isAncestor(repo, current, command.newOid)) {
         results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
       } else {
         repo.refs.set(command.ref, command.newOid);
+        noteReachable(repo, command.newOid);
         results.push({ ref: command.ref, ok: true, reason: '' });
       }
     }

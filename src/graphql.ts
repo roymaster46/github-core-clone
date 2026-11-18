@@ -14,6 +14,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { IssueRecord, PullRecord, RepoRecord, Store } from './types.ts';
 import { fromGlobalId, toGlobalId } from './types.ts';
 import { displayOwner, resolveRepo } from './store.ts';
+import { noteReachable } from './git.ts';
 
 // ---------------------------------------------------------------------------
 // Small utilities
@@ -235,6 +236,7 @@ export function squashMergePull(repo: RepoRecord, pull: PullRecord, actor: strin
   if (!headTree) return { error: 'missing head tree' };
   const sha = createCommitObject(repo, headTree, [baseSha], actor, `${pull.title} (#${pull.number})`);
   repo.refs.set(baseRef, sha);
+  noteReachable(repo, sha);
   pull.merged = true;
   pull.state = 'closed';
   pull.mergeCommitSha = sha;
@@ -250,6 +252,12 @@ export function squashMergePull(repo: RepoRecord, pull: PullRecord, actor: strin
 
 type CommentEntry = { id: string; body: string; created_at: string };
 const commentStore = new WeakMap<RepoRecord, Map<number, CommentEntry[]>>();
+/** Bumped on every comment add (REST or GraphQL): the REST issue-JSON cache keys on it. */
+const commentVersions = new WeakMap<RepoRecord, Map<number, number>>();
+
+export function commentVersionOf(repo: RepoRecord, issueNumber: number): number {
+  return commentVersions.get(repo)?.get(issueNumber) ?? 0;
+}
 
 export function addCommentRecord(repo: RepoRecord, issueNumber: number, body: string): CommentEntry {
   let perRepo = commentStore.get(repo);
@@ -266,6 +274,12 @@ export function addCommentRecord(repo: RepoRecord, issueNumber: number, body: st
   };
   list.push(entry);
   perRepo.set(issueNumber, list);
+  let versions = commentVersions.get(repo);
+  if (versions === undefined) {
+    versions = new Map();
+    commentVersions.set(repo, versions);
+  }
+  versions.set(issueNumber, (versions.get(issueNumber) ?? 0) + 1);
   return entry;
 }
 

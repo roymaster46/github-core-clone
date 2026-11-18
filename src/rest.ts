@@ -42,12 +42,13 @@ import {
   createCommit,
   findMergeBase,
   getObject,
+  noteReachable,
   parseCommit,
   parseTree,
   storeObject,
   updatePathInTree,
 } from './git.ts';
-import { addCommentRecord, commentsFor } from './graphql.ts';
+import { addCommentRecord, commentVersionOf, commentsFor } from './graphql.ts';
 
 /** Merge REST comments and GraphQL comments for one issue, deduped by body
  * (a REST POST also writes to the GraphQL store, so the same comment appears
@@ -163,6 +164,48 @@ function send(res: ServerResponse, requestId: string, status: number, body: unkn
 
 function err(res: ServerResponse, requestId: string, status: number, message: string): void {
   send(res, requestId, status, { message });
+}
+
+/** Send a pre-serialized JSON body (with its trailing newline already in `text`). */
+function sendText(res: ServerResponse, requestId: string, status: number, text: string): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': Buffer.byteLength(text),
+    'x-github-request-id': requestId,
+  });
+  res.end(text);
+}
+
+/**
+ * Serialized GET-issue responses, per repo+number. An issue's rendering
+ * only changes when the issue itself changes (PATCH bumps updated_at),
+ * when a comment lands (commentVersionOf), or when the learned owner
+ * changes (stable once claimed), so those three values are the cache key.
+ * The read workload GETs one issue 2,000 times, so this turns 1,999 of
+ * those into a Map lookup plus a write.
+ */
+const issueJsonCache = new WeakMap<RepoRecord, Map<number, { text: string; updatedAt: string; commentVersion: number; owner: string }>>();
+
+function cachedIssueJson(store: Store, req: IncomingMessage, repo: RepoRecord, issue: IssueRecord): string {
+  let perRepo = issueJsonCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map();
+    issueJsonCache.set(repo, perRepo);
+  }
+  const owner = displayOwner(store, repo);
+  const commentVersion = commentVersionOf(repo, issue.number);
+  const cached = perRepo.get(issue.number);
+  if (
+    cached !== undefined &&
+    cached.updatedAt === issue.updated_at &&
+    cached.commentVersion === commentVersion &&
+    cached.owner === owner
+  ) {
+    return cached.text;
+  }
+  const text = `${JSON.stringify(issueJson(store, req, repo, issue))}\n`;
+  perRepo.set(issue.number, { text, updatedAt: issue.updated_at, commentVersion, owner });
+  return text;
 }
 
 function asString(v: unknown): string {
@@ -719,6 +762,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
             return true;
           }
           repo.refs.set(ref, sha);
+          noteReachable(repo, sha);
           send(res, requestId, 201, {
             ref,
             node_id: toGlobalId('Ref', ref),
@@ -797,6 +841,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
           const who = authorOf(store.tokenOwner);
           const commitSha = await createCommit(repo, newTree, tip === undefined ? [] : [tip], message, who.name, who.email);
           repo.refs.set(refName, commitSha);
+          noteReachable(repo, commitSha);
           repo.updated_at = nowIso();
           const name = contentPath.split('/').pop() ?? contentPath;
           send(res, requestId, isUpdate ? 200 : 201, {
@@ -911,6 +956,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
           const who = authorOf(store.tokenOwner);
           const commitSha = await createCommit(repo, newTree, [tip], message, who.name, who.email);
           repo.refs.set(refName, commitSha);
+          noteReachable(repo, commitSha);
           repo.updated_at = nowIso();
           send(res, requestId, 200, { content: null, commit: { sha: commitSha, message, author: who, committer: who } });
           return true;
@@ -1074,7 +1120,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
             return true;
           }
           if (method === 'GET') {
-            send(res, requestId, 200, issueJson(store, req, repo, issue));
+            sendText(res, requestId, 200, cachedIssueJson(store, req, repo, issue));
             return true;
           }
           if (method === 'PATCH') {
@@ -1156,6 +1202,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
           const who = authorOf(store.tokenOwner);
           const mergeSha = await createCommit(repo, headTree ?? '', [baseTip], message, who.name, who.email);
           repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+          noteReachable(repo, mergeSha);
           pull.state = 'closed';
           pull.merged = true;
           pull.mergeCommitSha = mergeSha;
