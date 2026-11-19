@@ -66,12 +66,15 @@ async function keepTrying(step: () => Promise<boolean>): Promise<void> {
  * failure, just means the env may still be starting, so it is retried.
  */
 async function announcePort(port: number): Promise<void> {
+  // The payload never changes across retries: serialize it once instead
+  // of rebuilding the same JSON on every attempt.
+  const payload = JSON.stringify({ port });
   await keepTrying(async () => {
     try {
       const res = await fetch(`${ENV_ORIGIN}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ port }),
+        body: payload,
         signal: AbortSignal.timeout(REQUEST_BUDGET_MS),
       });
       if (res.status === 200 || res.status === 409) return true;
@@ -139,7 +142,12 @@ async function run(): Promise<void> {
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await awaitFinished();
-  server.close();
+  // server.close() waits for open connections; an idle keep-alive socket
+  // would hold the exit out for its whole 30 s idle timer, so force the
+  // exit after 5 s, exactly as the SIGTERM path already does.
+  server.closeIdleConnections();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5_000).unref();
   process.stdout.write('[entry] done\n');
 }
 

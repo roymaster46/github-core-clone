@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { GitObject, RepoRecord } from './types.ts';
-import { pathnameOf, searchParamsOf } from './transport.ts';
+import { bodyOf, pathnameOf, searchParamsOf } from './transport.ts';
 
 export type GitObjectType = 'blob' | 'tree' | 'commit' | 'tag';
 
@@ -931,6 +931,11 @@ function readPack(pack: Buffer, resolveBase: (oid: string) => GitObject | undefi
 // ---------------------------------------------------------------------------------------------
 
 async function readBody(req: IncomingMessage): Promise<Buffer> {
+  // Fast path: the transport already buffered the whole body before the
+  // handler ran (push workload: 200 receive-packs a round). Skip the async
+  // iterator's per-chunk promise churn and the Buffer.concat.
+  const fast = bodyOf(req);
+  if (fast !== undefined) return fast;
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
   return Buffer.concat(chunks);

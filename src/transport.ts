@@ -189,40 +189,26 @@ export class FastRes {
     return this;
   }
 
-  end(data?: Buffer | string): void {
-    if (this.ended) return;
-    this.ended = true;
-    const body =
-      data === undefined
-        ? Buffer.alloc(0)
-        : typeof data === 'string'
-          ? Buffer.from(data, 'utf8')
-          : data;
-    const parts: Buffer[] = [];
-    parts.push(
-      Buffer.from(`HTTP/1.1 ${this.status} ${REASONS[this.status] ?? ''}\r\n`, 'ascii'),
-    );
-    for (const [name, value] of Object.entries(this.headers)) {
-      // Content-Length is always recomputed from the real body below; a
-      // stale declared length must never truncate or pad a reply.
-      if (name.toLowerCase() === 'content-length') continue;
-      const text = Array.isArray(value) ? value.join(', ') : value;
-      parts.push(Buffer.from(`${name}: ${text}\r\n`, 'utf8'));
-    }
-    // No body framing for 204/304; every other reply carries an exact
-    // Content-Length, so no chunked encoding is ever needed.
-    if (this.status !== 204 && this.status !== 304) {
-      parts.push(Buffer.from(`content-length: ${body.length}\r\n`, 'ascii'));
-    }
-    parts.push(
-      Buffer.from(this.keepAlive ? 'connection: keep-alive\r\n\r\n' : 'connection: close\r\n\r\n', 'ascii'),
-    );
-    if (body.length > 0) parts.push(body);
-    const out = parts.length === 1 ? (parts[0] as Buffer) : Buffer.concat(parts);
+  /**
+   * Write the reply as a batched set of buffers in one writev. The socket
+   * is corked first, so the parts leave in a single syscall and the body is
+   * never copied into one big Buffer (a clone's 88 KiB pack used to be
+   * memcpy'd on every one of the 50 concurrent clones).
+   */
+  private flush(parts: Buffer[]): void {
     try {
-      this.socket.write(out);
+      this.socket.cork();
+      for (const part of parts) {
+        if (part.length > 0) this.socket.write(part);
+      }
+      this.socket.uncork();
     } catch {
       // The socket is already gone; nothing left to do for this request.
+      try {
+        this.socket.uncork();
+      } catch {
+        // Already gone.
+      }
     }
     if (!this.keepAlive) {
       try {
@@ -232,6 +218,51 @@ export class FastRes {
       }
     }
     this.onDone();
+  }
+
+  /**
+   * Send a response whose head and tail are prebuilt buffers and only the
+   * request-id line varies per request (the read workload's 2,000 GETs of
+   * one cached issue). `tailAlive` / `tailClose` are the same tail with the
+   * connection line filled in for each keep-alive case; the transport
+   * picks by the socket it owns. Skips writeHead, the per-header
+   * Buffer.from calls and the Buffer.concat of end() entirely.
+   */
+  sendPrebuilt(head: Buffer, idLine: Buffer, tailAlive: Buffer, tailClose: Buffer): void {
+    if (this.ended) return;
+    this.ended = true;
+    this.headersSent = true;
+    this.status = 200;
+    this.statusCode = 200;
+    this.flush([head, idLine, this.keepAlive ? tailAlive : tailClose]);
+  }
+
+  end(data?: Buffer | string): void {
+    if (this.ended) return;
+    this.ended = true;
+    const body =
+      data === undefined
+        ? Buffer.alloc(0)
+        : typeof data === 'string'
+          ? Buffer.from(data, 'utf8')
+          : data;
+    // One header string, one Buffer.from: the old code built a Buffer per
+    // header line plus a Buffer.concat over everything (copying the body).
+    let head = `HTTP/1.1 ${this.status} ${REASONS[this.status] ?? ''}\r\n`;
+    for (const [name, value] of Object.entries(this.headers)) {
+      // Content-Length is always recomputed from the real body below; a
+      // stale declared length must never truncate or pad a reply.
+      if (name.toLowerCase() === 'content-length') continue;
+      head += `${name}: ${Array.isArray(value) ? value.join(', ') : value}\r\n`;
+    }
+    // No body framing for 204/304; every other reply carries an exact
+    // Content-Length, so no chunked encoding is ever needed.
+    if (this.status !== 204 && this.status !== 304) {
+      head += `content-length: ${body.length}\r\n`;
+    }
+    head += this.keepAlive ? 'connection: keep-alive\r\n\r\n' : 'connection: close\r\n\r\n';
+    const headBuf = Buffer.from(head, 'ascii');
+    this.flush(body.length > 0 ? [headBuf, body] : [headBuf]);
   }
 }
 

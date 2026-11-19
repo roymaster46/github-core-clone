@@ -53,6 +53,21 @@ p50 ~375–381k µs. Production p50 for round 3 was 703,866 µs (rank 7,518);
 round 4's server-CPU cut is the lever to move it, though the ~305k µs
 top-Go figure is out of Node's reach (best Node entry ever: ~390k µs).
 
+Round 5 (2026-11-19, same kit, fresh leaderboard: round 4 sits at rank 535,
+score 942, perf 142, production p50 445,378 µs): **120/120 checks pass**
+again on every run. The VM was heavily loaded by parallel Round-3 work
+during this round, so local wall-clock p50s (556k–922k µs) are not
+comparable to round 4's quiet-window 413,867 µs; the stable measure is
+server CPU per request from interleaved A/B micro-benchmarks (raw-socket
+client, `/proc` CPU, r5/r4/r5/r4): read 41–47 µs/req vs 50–57 µs/req
+(−17%), push ~742 vs ~783 µs/op (flat, within noise), clone ~600–800 µs
+(flat), write ~115–160 vs ~150 µs (inconclusive). Full suite+perf server
+CPU is flat too (median 1.92 s vs 1.90 s) because the read workload is a
+small share of it and push/clone did not move. Expected production gain:
+a few perf points (read is ~1 of 4 workloads and was already near its
+local ceiling), score ~944–948, rank ~510–530 — still far from the Go
+top (305k µs, score 970). This round is a Node fallback: real but small.
+
 ## Hot paths
 
 - **Push** (`src/git.ts`): the old receive-pack re-parsed every commit and
@@ -78,6 +93,15 @@ top-Go figure is out of Node's reach (best Node entry ever: ~390k µs).
   is one shared Buffer (every clone asks for it three times) and the v0
   advertisement is cached per ref-set fingerprint. Server CPU per
   full suite+perf run fell ~30% vs the `node:http` build.
+- **Round 5 transport + REST**: `FastRes.end` builds the header as one
+  string and one `Buffer.from`, then writes head+body through
+  `socket.cork()/uncork()` — the body is never `Buffer.concat`'d (a
+  clone's 88 KiB pack used to be memcpy'd per clone). `FastRes.sendPrebuilt`
+  sends a cached GET-issue reply as three prebuilt buffers (head, per-request
+  id line, tail per keep-alive case) with no `writeHead`, no per-header
+  `Buffer.from`, no concat. `readBody` (REST and git) takes the transport's
+  already-buffered body via `bodyOf` instead of async-iterating it, and
+  path segments skip `decodeURIComponent` unless they contain `%`.
 - **Lifecycle** (`main.ts`): the transport owns the idle-socket timeout
   and the malformed-request 400; SIGTERM drops idle sockets first, then
   closes the server and exits 0.

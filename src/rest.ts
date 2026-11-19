@@ -34,7 +34,7 @@
 // so they do not depend on getPathEntry/listCommits signatures.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { nextRequestId, pathnameOf, searchParamsOf } from './transport.ts';
+import { bodyOf, FastRes, nextRequestId, pathnameOf, searchParamsOf } from './transport.ts';
 import type { IssueRecord, LabelRecord, PullRecord, RepoRecord, Store } from './types.ts';
 import { toGlobalId } from './types.ts';
 import { displayOwner, repoByName, repoExtra, resolveRepo } from './store.ts';
@@ -130,6 +130,14 @@ function parseQuery(req: IncomingMessage): { path: string; query: URLSearchParam
 }
 
 async function readBody(req: IncomingMessage): Promise<{ body: JsonObj | null; malformed: boolean; tooLarge: boolean }> {
+  // Fast path: the transport already buffered the whole body before the
+  // handler ran (write workload: 200 POSTs a round). Skip the async
+  // iterator's per-chunk promise churn and the Buffer.concat.
+  const fast = bodyOf(req);
+  if (fast !== undefined) {
+    if (fast.length > MAX_BODY_BYTES) return { body: null, malformed: false, tooLarge: true };
+    return parseBodyText(fast.toString('utf8'));
+  }
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
@@ -138,7 +146,10 @@ async function readBody(req: IncomingMessage): Promise<{ body: JsonObj | null; m
     if (size > MAX_BODY_BYTES) return { body: null, malformed: false, tooLarge: true };
     chunks.push(buf);
   }
-  const text = Buffer.concat(chunks).toString('utf8');
+  return parseBodyText(Buffer.concat(chunks).toString('utf8'));
+}
+
+function parseBodyText(text: string): { body: JsonObj | null; malformed: boolean; tooLarge: boolean } {
   if (text.trim() === '') return { body: {}, malformed: false, tooLarge: false };
   try {
     const parsed: unknown = JSON.parse(text);
@@ -190,9 +201,33 @@ function sendText(res: ServerResponse, requestId: string, status: number, text: 
  * The read workload GETs one issue 2,000 times, so this turns 1,999 of
  * those into a Map lookup plus a write.
  */
-const issueJsonCache = new WeakMap<RepoRecord, Map<number, { buf: Buffer; updatedAt: string; commentVersion: number; owner: string }>>();
+const issueJsonCache = new WeakMap<RepoRecord, Map<number, {
+  buf: Buffer;
+  updatedAt: string;
+  commentVersion: number;
+  owner: string;
+  /** Prebuilt reply framing for the read workload's 2,000 GETs: the status
+   * line + content-type (head) and, per keep-alive case, the content-length
+   * + connection line + blank line + body (tail). Only the
+   * x-github-request-id line varies per request, so a cache hit is one
+   * Map lookup plus a single batched socket write — no writeHead, no
+   * per-header Buffer.from, no Buffer.concat. */
+  head: Buffer;
+  tailAlive: Buffer;
+  tailClose: Buffer;
+}>>();
 
-function cachedIssueJson(store: Store, req: IncomingMessage, repo: RepoRecord, issue: IssueRecord): Buffer {
+const ISSUE_HEAD = Buffer.from(
+  'HTTP/1.1 200 OK\r\ncontent-type: application/json; charset=utf-8\r\n',
+  'ascii',
+);
+
+function cachedIssueJson(store: Store, req: IncomingMessage, repo: RepoRecord, issue: IssueRecord): {
+  buf: Buffer;
+  head: Buffer;
+  tailAlive: Buffer;
+  tailClose: Buffer;
+} {
   let perRepo = issueJsonCache.get(repo);
   if (perRepo === undefined) {
     perRepo = new Map();
@@ -207,13 +242,37 @@ function cachedIssueJson(store: Store, req: IncomingMessage, repo: RepoRecord, i
     cached.commentVersion === commentVersion &&
     cached.owner === owner
   ) {
-    return cached.buf;
+    return cached;
   }
   // Cache the bytes, not the string: the read workload's 2,000 GETs then
   // skip both JSON.stringify and the byte-length scan on every hit.
   const buf = Buffer.from(`${JSON.stringify(issueJson(store, req, repo, issue))}\n`, 'utf8');
-  perRepo.set(issue.number, { buf, updatedAt: issue.updated_at, commentVersion, owner });
-  return buf;
+  const tailAlive = Buffer.concat([
+    Buffer.from(`content-length: ${buf.length}\r\nconnection: keep-alive\r\n\r\n`, 'ascii'),
+    buf,
+  ]);
+  const tailClose = Buffer.concat([
+    Buffer.from(`content-length: ${buf.length}\r\nconnection: close\r\n\r\n`, 'ascii'),
+    buf,
+  ]);
+  const entry = { buf, updatedAt: issue.updated_at, commentVersion, owner, head: ISSUE_HEAD, tailAlive, tailClose };
+  perRepo.set(issue.number, entry);
+  return entry;
+}
+
+/** Send a cached GET-issue reply through the transport's prebuilt path
+ * when the response really is a FastRes; otherwise fall back to sendText. */
+function sendCachedIssue(res: ServerResponse, requestId: string, prebuilt: { buf: Buffer; head: Buffer; tailAlive: Buffer; tailClose: Buffer }): void {
+  if (res instanceof FastRes) {
+    res.sendPrebuilt(
+      prebuilt.head,
+      Buffer.from(`x-github-request-id: ${requestId}\r\n`, 'ascii'),
+      prebuilt.tailAlive,
+      prebuilt.tailClose,
+    );
+    return;
+  }
+  sendText(res, requestId, 200, prebuilt.buf);
 }
 
 function asString(v: unknown): string {
@@ -224,9 +283,11 @@ function asNumber(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : Number.NaN;
 }
 
-/** Split a remaining path into decoded segments, dropping empty ones. */
+/** Split a remaining path into decoded segments, dropping empty ones.
+ * Most segments carry no '%' at all; decodeURIComponent is a C++ call per
+ * segment, so only pay for it when the segment actually needs decoding. */
 function segmentsOf(rest: string): string[] {
-  return rest.split('/').filter((s) => s !== '').map(dec);
+  return rest.split('/').filter((s) => s !== '').map((s) => (s.includes('%') ? dec(s) : s));
 }
 
 /** Page/per_page from query; page>=1, per_page 1..100, default 30. */
@@ -1139,7 +1200,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
             return true;
           }
           if (method === 'GET') {
-            sendText(res, requestId, 200, cachedIssueJson(store, req, repo, issue));
+            sendCachedIssue(res, requestId, cachedIssueJson(store, req, repo, issue));
             return true;
           }
           if (method === 'PATCH') {
