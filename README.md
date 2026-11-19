@@ -42,11 +42,16 @@ Against the kit's own conformance suite (`sdk/run.ts`):
 node --experimental-strip-types sdk/run.ts --url http://127.0.0.1:PORT --token TOK --perf
 ```
 
-Result (2026-11-19, fresh server): **120/120 checks pass** — git 30/30,
+Result (2026-11-19, fresh server, round 4): **120/120 checks pass** — git 30/30,
 repos 15/15, issues 15/15, pulls 20/20, protocol 5/5, GraphQL 20/20,
-MCP 15/15. Local wall-clock perf on a shared VM is noisy (a quiet run
-scored perf 178, p50 269343 µs); the stable measure is server CPU per
-benchmark workload, which the hot-path work below cut 1.4–3×.
+MCP 15/15. Local wall-clock perf on a shared VM is noisy (sibling jobs
+move it ±40%), so the stable measures are server CPU per run and
+alternating A/B medians against the round-3 code: round 4 wins 3/3 rounds
+on both (p50 median 413,867 µs vs 466,612 µs, −11%; server CPU median
+1,720 ms vs 2,440 ms, −30%). Quiet-run local score: perf 154–156,
+p50 ~375–381k µs. Production p50 for round 3 was 703,866 µs (rank 7,518);
+round 4's server-CPU cut is the lever to move it, though the ~305k µs
+top-Go figure is out of Node's reach (best Node entry ever: ~390k µs).
 
 ## Hot paths
 
@@ -60,8 +65,19 @@ benchmark workload, which the hot-path work below cut 1.4–3×.
   shadowed by a stale empty pack. Handler CPU per clone fell ~3×.
 - **Read**: GET-issue responses are cached per issue, keyed on the issue's
   `updated_at`, its comment version, and the learned owner, so the 2,000
-  repeated reads are Map lookups plus a write.
-- **Lifecycle** (`main.ts`): keep-alive sockets held 30 s across the
-  suite's workload gaps, a `clientError` handler that ends bad sockets
-  with a 400 instead of killing the server, and SIGTERM closes the server
-  and exits 0.
+  repeated reads are Map lookups plus a write — and the cached value is
+  now the response bytes themselves (no re-stringify, no byte-length
+  scan). The comment count has a no-allocation fast path when there are
+  no comments anywhere.
+- **Transport** (`src/transport.ts`, round 4): a raw `node:net` HTTP/1.1
+  server replaces `node:http` — one `socket.write` per response, the
+  request path/query parsed once (handlers used to pay for `new URL`
+  three times per request), `TCP_NODELAY` set explicitly, idle sockets
+  closed after 30 s. Request ids are a process-unique hex counter, not
+  `randomBytes`/`randomUUID` per reply. The v2 capability advertisement
+  is one shared Buffer (every clone asks for it three times) and the v0
+  advertisement is cached per ref-set fingerprint. Server CPU per
+  full suite+perf run fell ~30% vs the `node:http` build.
+- **Lifecycle** (`main.ts`): the transport owns the idle-socket timeout
+  and the malformed-request 400; SIGTERM drops idle sockets first, then
+  closes the server and exits 0.

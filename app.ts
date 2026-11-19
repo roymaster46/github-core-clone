@@ -1,13 +1,20 @@
 // The forge's HTTP surface: routes every request to the module that owns it.
 // main.ts (lifecycle) is unchanged; this file wires git smart HTTP, REST v3,
 // GraphQL v4 and MCP onto one shared in-memory store.
+//
+// Transport: a raw node:net HTTP/1.1 server (src/transport.ts) instead of
+// node:http — one socket.write per response, no IncomingMessage machinery,
+// and the request path/query parsed once here (handlers used to pay for
+// `new URL(req.url)` three times per request). Routing itself is unchanged.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Server } from 'node:net';
 import { MemoryStore, resolveRepo } from './src/store.ts';
 import { handleRest } from './src/rest.ts';
 import { handleGit } from './src/git.ts';
 import { handleGraphql } from './src/graphql.ts';
 import { handleMcp } from './src/mcp.ts';
+import { createTransportServer, pathnameOf } from './src/transport.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -17,19 +24,12 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
-}
-
 export function createApp(): Server {
   const store = new MemoryStore();
 
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
+  return createTransportServer((req: IncomingMessage, res: ServerResponse) => {
+    // The transport already parsed the path (no `new URL` per request).
+    const path = pathnameOf(req) ?? '/';
     const method = req.method ?? 'GET';
 
     // The env's boot check calls this twice: 200 {"ok":true}. No auth.

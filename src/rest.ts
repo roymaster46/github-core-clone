@@ -33,8 +33,8 @@
 // Path lookup and commit listing are implemented here on getObject/parseCommit,
 // so they do not depend on getPathEntry/listCommits signatures.
 
-import { randomBytes } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { nextRequestId, pathnameOf, searchParamsOf } from './transport.ts';
 import type { IssueRecord, LabelRecord, PullRecord, RepoRecord, Store } from './types.ts';
 import { toGlobalId } from './types.ts';
 import { displayOwner, repoByName, repoExtra, resolveRepo } from './store.ts';
@@ -116,6 +116,11 @@ function baseUrlOf(req: IncomingMessage): string {
 }
 
 function parseQuery(req: IncomingMessage): { path: string; query: URLSearchParams } {
+  // The transport already split the target: no `new URL` per request.
+  const fastPath = pathnameOf(req);
+  if (fastPath !== undefined) {
+    return { path: fastPath, query: searchParamsOf(req) ?? new URLSearchParams() };
+  }
   try {
     const u = new URL(req.url ?? '/', 'http://entry');
     return { path: u.pathname, query: u.searchParams };
@@ -167,13 +172,14 @@ function err(res: ServerResponse, requestId: string, status: number, message: st
 }
 
 /** Send a pre-serialized JSON body (with its trailing newline already in `text`). */
-function sendText(res: ServerResponse, requestId: string, status: number, text: string): void {
+function sendText(res: ServerResponse, requestId: string, status: number, text: string | Buffer): void {
+  const buf = typeof text === 'string' ? Buffer.from(text, 'utf8') : text;
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': buf.length,
     'x-github-request-id': requestId,
   });
-  res.end(text);
+  res.end(buf);
 }
 
 /**
@@ -184,9 +190,9 @@ function sendText(res: ServerResponse, requestId: string, status: number, text: 
  * The read workload GETs one issue 2,000 times, so this turns 1,999 of
  * those into a Map lookup plus a write.
  */
-const issueJsonCache = new WeakMap<RepoRecord, Map<number, { text: string; updatedAt: string; commentVersion: number; owner: string }>>();
+const issueJsonCache = new WeakMap<RepoRecord, Map<number, { buf: Buffer; updatedAt: string; commentVersion: number; owner: string }>>();
 
-function cachedIssueJson(store: Store, req: IncomingMessage, repo: RepoRecord, issue: IssueRecord): string {
+function cachedIssueJson(store: Store, req: IncomingMessage, repo: RepoRecord, issue: IssueRecord): Buffer {
   let perRepo = issueJsonCache.get(repo);
   if (perRepo === undefined) {
     perRepo = new Map();
@@ -201,11 +207,13 @@ function cachedIssueJson(store: Store, req: IncomingMessage, repo: RepoRecord, i
     cached.commentVersion === commentVersion &&
     cached.owner === owner
   ) {
-    return cached.text;
+    return cached.buf;
   }
-  const text = `${JSON.stringify(issueJson(store, req, repo, issue))}\n`;
-  perRepo.set(issue.number, { text, updatedAt: issue.updated_at, commentVersion, owner });
-  return text;
+  // Cache the bytes, not the string: the read workload's 2,000 GETs then
+  // skip both JSON.stringify and the byte-length scan on every hit.
+  const buf = Buffer.from(`${JSON.stringify(issueJson(store, req, repo, issue))}\n`, 'utf8');
+  perRepo.set(issue.number, { buf, updatedAt: issue.updated_at, commentVersion, owner });
+  return buf;
 }
 
 function asString(v: unknown): string {
@@ -296,6 +304,17 @@ function labelJson(label: LabelRecord): JsonObj {
   return { id: 0, node_id: toGlobalId('Label', label.name), name: label.name, color: label.color, description: label.description, default: false };
 }
 
+/** Comment count without building the merged list: the common case (no
+ * comments anywhere) is two Map lookups and no allocation. Falls back to
+ * the deduped merge whenever either side is non-empty, so the count stays
+ * exact. */
+function commentCount(repo: RepoRecord, number: number): number {
+  const restList = commentsByIssue.get(`${repo.owner}/${repo.name}#${number}`);
+  const gqlList = commentsFor(repo, number);
+  if ((restList === undefined || restList.length === 0) && gqlList.length === 0) return 0;
+  return allComments(repo, number).length;
+}
+
 function issueJson(store: Store, req: IncomingMessage, repo: RepoRecord, issue: IssueRecord): JsonObj {
   const owner = displayOwner(store, repo);
   const base = baseUrlOf(req);
@@ -316,7 +335,7 @@ function issueJson(store: Store, req: IncomingMessage, repo: RepoRecord, issue: 
     assignees: [],
     milestone: null,
     locked: false,
-    comments: allComments(repo, issue.number).length,
+    comments: commentCount(repo, issue.number),
     created_at: issue.created_at,
     updated_at: issue.updated_at,
     closed_at: issue.state === 'closed' ? issue.updated_at : null,
@@ -535,7 +554,7 @@ function setPrivate(repo: RepoRecord, value: boolean): void {
 export async function handleRest(req: IncomingMessage, res: ServerResponse, store: Store): Promise<boolean> {
   const { path, query } = parseQuery(req);
   if (path !== '/api/v3' && !path.startsWith('/api/v3/')) return false;
-  const requestId = randomBytes(8).toString('hex');
+  const requestId = nextRequestId();
   const method = req.method ?? 'GET';
 
   // Auth first: every /api/v3 request needs the bearer token (no exceptions).

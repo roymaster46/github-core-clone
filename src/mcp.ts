@@ -8,6 +8,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { RepoRecord, Store } from './types.ts';
 import { resolveRepo } from './store.ts';
+import { pathnameOf } from './transport.ts';
 import {
   createIssueRecord,
   createPullRecord,
@@ -291,11 +292,14 @@ function callTool(store: Store, name: string, args: Record<string, unknown>): Re
 // ---------------------------------------------------------------------------
 
 export async function handleMcp(req: IncomingMessage, res: ServerResponse, store: Store): Promise<boolean> {
-  let pathname = '';
-  try {
-    pathname = new URL(req.url ?? '/', 'http://x').pathname;
-  } catch {
-    return false;
+  // The transport already parsed the path: no `new URL` per request.
+  let pathname = pathnameOf(req);
+  if (pathname === undefined) {
+    try {
+      pathname = new URL(req.url ?? '/', 'http://x').pathname;
+    } catch {
+      return false;
+    }
   }
   if (pathname !== '/mcp') return false;
   if (req.method === 'DELETE') {

@@ -10,7 +10,8 @@
 // Do not change this without aligning rest.ts.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
+import { nextRequestId, pathnameOf } from './transport.ts';
 import type { IssueRecord, PullRecord, RepoRecord, Store } from './types.ts';
 import { fromGlobalId, toGlobalId } from './types.ts';
 import { displayOwner, resolveRepo } from './store.ts';
@@ -1340,14 +1341,17 @@ function executeOperation(op: Operation, vars: Record<string, unknown>, store: S
 // ---------------------------------------------------------------------------
 
 export async function handleGraphql(req: IncomingMessage, res: ServerResponse, store: Store): Promise<boolean> {
-  let pathname = '';
-  try {
-    pathname = new URL(req.url ?? '/', 'http://x').pathname;
-  } catch {
-    return false;
+  // The transport already parsed the path: no `new URL` per request.
+  let pathname = pathnameOf(req);
+  if (pathname === undefined) {
+    try {
+      pathname = new URL(req.url ?? '/', 'http://x').pathname;
+    } catch {
+      return false;
+    }
   }
   if (pathname !== '/api/graphql') return false;
-  const requestId = randomUUID();
+  const requestId = nextRequestId();
   if (req.method !== 'POST') {
     sendJson(res, 405, { message: 'method not allowed' }, requestId);
     return true;

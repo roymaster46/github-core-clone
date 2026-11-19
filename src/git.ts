@@ -17,6 +17,7 @@ import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { GitObject, RepoRecord } from './types.ts';
+import { pathnameOf, searchParamsOf } from './transport.ts';
 
 export type GitObjectType = 'blob' | 'tree' | 'commit' | 'tag';
 
@@ -972,6 +973,16 @@ function listRefs(repo: RepoRecord): RefLine[] {
 }
 
 function v0Advertisement(repo: RepoRecord, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  // Fingerprint cache: the ad is fully determined by the ref set (oids are
+  // content hashes, so a ref's peeled target is fixed once its object is
+  // present, and objects never change). Every push advertises first, so
+  // this turns the advertisement into a Map lookup plus a short string
+  // join instead of rebuilding pkt-lines on every push.
+  const names = [...repo.refs.keys()].sort();
+  let fp = service;
+  for (const name of names) fp += `\0${name}=${repo.refs.get(name)}`;
+  const cached = v0AdCache.get(repo);
+  if (cached !== undefined && cached.fp === fp) return cached.buf;
   const caps =
     service === 'git-upload-pack'
       ? `side-band-64k thin-pack ofs-delta shallow agent=${AGENT} symref=HEAD:refs/heads/main`
@@ -989,18 +1000,27 @@ function v0Advertisement(repo: RepoRecord, service: 'git-upload-pack' | 'git-rec
     }
   }
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const buf = Buffer.concat(parts);
+  v0AdCache.set(repo, { fp, buf });
+  return buf;
 }
 
+/** Fingerprinted v0 advertisements, per repo (see v0Advertisement). */
+const v0AdCache = new WeakMap<RepoRecord, { fp: string; buf: Buffer }>();
+
+/** The v2 capability advertisement never changes: build it once, share it.
+ * Every clone asks for it three times (advertisement, ls-refs, fetch). */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow filter\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow filter\n'),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1011,9 +1031,8 @@ function handleInfoRefs(
   req: IncomingMessage,
   res: ServerResponse,
   repo: RepoRecord | undefined,
-  url: URL,
+  service: string | null,
 ): boolean {
-  const service = url.searchParams.get('service');
   if (!repo) {
     sendJson(res, 404, { message: 'repository not found' });
     return true;
@@ -1395,11 +1414,14 @@ export async function handleGit(
   res: ServerResponse,
   repo: RepoRecord,
 ): Promise<boolean> {
-  let pathname = '';
-  try {
-    pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
-  } catch {
-    return false;
+  // The transport already parsed the path and query: no `new URL` here.
+  let pathname = pathnameOf(req);
+  if (pathname === undefined) {
+    try {
+      pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
+    } catch {
+      return false;
+    }
   }
   try {
     if (pathname.endsWith('/info/refs')) {
@@ -1407,8 +1429,16 @@ export async function handleGit(
         sendJson(res, 405, { message: 'method not allowed' });
         return true;
       }
-      const url = new URL(req.url ?? '/', 'http://localhost');
-      return handleInfoRefs(req, res, repo, url);
+      const service =
+        searchParamsOf(req)?.get('service') ??
+        (() => {
+          try {
+            return new URL(req.url ?? '/', 'http://localhost').searchParams.get('service');
+          } catch {
+            return null;
+          }
+        })();
+      return handleInfoRefs(req, res, repo, service);
     }
     if (pathname.endsWith('/git-upload-pack')) {
       if (req.method !== 'POST') {

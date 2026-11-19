@@ -106,19 +106,11 @@ async function awaitFinished(): Promise<void> {
 /** Bind the forge, announce it, then wait for the env: the whole life of the process. */
 async function run(): Promise<void> {
   const server = createApp();
-  // Keep one idle keep-alive socket alive across the gaps between the
-  // suite's workloads (the read workload reuses a single connection for
-  // 2,000 requests; the 5 s default would close it between phases and
-  // force a reconnect). A malformed request ends its socket with a 400
-  // instead of taking the server down with it.
-  server.keepAliveTimeout = 30_000;
-  server.on('clientError', (_err, socket) => {
-    try {
-      socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
-    } catch {
-      socket.destroy();
-    }
-  });
+  // The transport is a raw node:net server: it sets TCP_NODELAY per socket
+  // and closes idle keep-alive sockets after IDLE_TIMEOUT_MS itself, so
+  // there is no http keepAliveTimeout or clientError handler to set here.
+  // A malformed request ends its socket with a 400 instead of taking the
+  // server down with it (handled inside the transport).
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, () => resolve());
@@ -131,12 +123,14 @@ async function run(): Promise<void> {
 
   // The trial ends with SIGTERM: close the server and exit 0 instead of
   // dying on the signal (a 143 exit reads as a crash to the harness).
-  // server.close() waits for open connections, so a 5 s fallback forces
-  // the exit if a keep-alive socket holds it open.
+  // Drop idle keep-alive sockets first, so server.close() does not wait
+  // out their 30 s idle timer; server.close() waits for open connections,
+  // so a 5 s fallback forces the exit if a socket still holds it open.
   let stopping = false;
   process.once('SIGTERM', () => {
     if (stopping) return;
     stopping = true;
+    server.closeIdleConnections();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 5_000).unref();
   });
